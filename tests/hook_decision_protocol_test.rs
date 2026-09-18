@@ -925,3 +925,21 @@ mod rewrite_host_scoping {
         assert!(!denied.recorded_a_recall());
     }
 }
+
+#[test]
+fn tab_separators_reach_rewrite_and_claude_hook() {
+    let sb = Sandbox::bare();
+    for (cmd, expected) in [
+        ("git\tstatus", "rtk git status"),
+        ("cargo\tbuild", "rtk cargo build"),
+        ("npm\trun build", "rtk npm run build"),
+        ("pnpm\tinstall", "rtk pnpm install"),
+    ] {
+        assert_eq!(sb.rewrite(cmd), (3, expected.into()), "{cmd:?}");
+        assert_eq!(
+            sb.hook_claude_rewrite(cmd),
+            Some(expected.into()),
+            "{cmd:?}"
+        );
+    }
+}
