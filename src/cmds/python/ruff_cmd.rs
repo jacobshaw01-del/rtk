@@ -1,5 +1,6 @@
 //! Filters Ruff linter and formatter output.
 
+use crate::core::arg_tokenizer::{self, Dialect, TokenKind, ValueSpec};
 use crate::core::args_utils;
 use crate::core::config;
 use crate::core::runner;
@@ -51,6 +52,13 @@ struct RuffDiagnostic {
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let args = &args_utils::restore_double_dash(args);
+    if is_server_invocation(args) {
+        // LSP is a live, byte-framed protocol: capture mode closes stdin and
+        // buffers stdout until exit, preventing the editor/server handshake.
+        let args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        return runner::run_passthrough("ruff", &args, verbose);
+    }
+
     let is_check = is_check_invocation(args);
 
     let is_format = args.iter().any(|a| a == "format");
@@ -135,6 +143,23 @@ fn filter_passthrough_output(stdout: &str, is_analyze_graph: bool) -> String {
     } else {
         truncate(stdout.trim(), config::limits().passthrough_max_chars)
     }
+}
+
+fn is_server_invocation(args: &[String]) -> bool {
+    // These are Ruff's value-taking global options, which may precede the
+    // subcommand. Their values (including a file named `server`) are not verbs.
+    let tokens = arg_tokenizer::tokenize_grammar(
+        args,
+        &|kind, name| match (kind, name) {
+            (TokenKind::Long, "config" | "color") => Some(ValueSpec::value()),
+            _ => None,
+        },
+        Dialect::Posix,
+    );
+    arg_tokenizer::before_dashdash(&tokens)
+        .iter()
+        .find(|token| token.is_free_positional())
+        .is_some_and(|token| token.text == "server")
 }
 
 fn is_check_invocation(args: &[String]) -> bool {
@@ -422,6 +447,32 @@ fn compact_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_routing_respects_subcommands_values_and_separator() {
+        for args in [
+            vec!["server"],
+            vec!["--isolated", "server", "--preview"],
+            vec!["--config", "ruff.toml", "server"],
+            vec!["--config=server", "--color=never", "server"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(is_server_invocation(&args), "{args:?}");
+        }
+        for args in [
+            vec![],
+            vec!["check", "server"],
+            vec!["format", "server"],
+            vec!["help", "server"],
+            vec!["--config", "server", "check"],
+            vec!["--color", "server"],
+            vec!["--config=server", "check"],
+            vec!["--", "server"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert!(!is_server_invocation(&args), "{args:?}");
+        }
+    }
 
     #[test]
     fn known_ruff_subcommands_do_not_route_through_check() {
