@@ -157,6 +157,20 @@ fn requests_json(args: &[String]) -> bool {
         .any(|t| t.kind == TokenKind::Long && t.text == "json")
 }
 
+/// Whether the caller asked for context lines (`-A`/`-B`/`-C` or their long forms). Context and
+/// match lines share the `path:line:` prefix, so the per-file cap cannot tell them apart and would
+/// cut the very detail the caller requested; such runs pass through unchanged.
+fn requests_context(args: &[String]) -> bool {
+    let tokens =
+        arg_tokenizer::tokenize_grammar(args, &run_takes_value, arg_tokenizer::Dialect::Posix);
+    arg_tokenizer::before_dashdash(&tokens).iter().any(|t| {
+        matches!(
+            (t.kind, t.text),
+            (TokenKind::Short, "A" | "B" | "C") | (TokenKind::Long, "after" | "before" | "context")
+        )
+    })
+}
+
 /// Counts non-blank lines that are not `path:line:content`.
 ///
 /// Plain `ast-grep run` output is made up entirely of that shape. Other modes
@@ -292,7 +306,7 @@ pub fn run(args: &[String]) -> Result<i32> {
     let result = exec_capture(&mut cmd).context("Failed to execute ast-grep")?;
 
     let filtered_owned;
-    let filtered: &str = if is_json {
+    let filtered: &str = if is_json || requests_context(args) {
         &result.stdout
     } else {
         let mut out = filter_ast_grep(&result.stdout, DEFAULT_MAX_PER_FILE, DEFAULT_MAX_TOTAL);
