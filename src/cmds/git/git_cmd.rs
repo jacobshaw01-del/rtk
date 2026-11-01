@@ -1958,8 +1958,21 @@ fn run_log(
     }
 
     // Post-process: truncate long messages, cap lines only if RTK set the default
-    let filtered = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
-    let filtered = never_worse(&result.stdout, &filtered).to_string();
+    let folded = filter_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
+    let full = full_log_output(&result.stdout, limit, user_set_limit, has_format_flag);
+    // Folded bodies and truncated lines are otherwise unrecoverable, so a lossy fold stores the
+    // unfolded commits and points at them, as every other capping filter does. When the fold
+    // saves less than the hint costs, the complete raw output is the smaller answer.
+    let filtered = if full == folded {
+        never_worse(&result.stdout, &folded).to_string()
+    } else if result.stdout.len() <= folded.len() + LOG_HINT_RESERVE {
+        result.stdout.trim_end().to_string()
+    } else {
+        match crate::core::tee::force_tee_hint(&full, "git_log") {
+            Some(hint) => format!("{folded}\n{hint}"),
+            None => never_worse(&result.stdout, &folded).to_string(),
+        }
+    };
     println!("{}", filtered);
 
     timer.track(
@@ -2234,7 +2247,33 @@ pub(crate) fn filter_log_output(
     user_set_limit: bool,
     user_format: bool,
 ) -> String {
-    let truncate_width = if user_set_limit { 120 } else { 80 };
+    render_log(output, limit, user_set_limit, user_format, true)
+}
+
+/// Room a recall hint takes (`[full output: rtk recall <16 hex>]` plus its newline), rounded up:
+/// a fold that saves less than this prints the raw log instead.
+const LOG_HINT_RESERVE: usize = 64;
+
+/// The same commits `filter_log_output` shows, with every body line and at full width: what the
+/// recall hint hands back when folding or truncation dropped anything.
+fn full_log_output(output: &str, limit: usize, user_set_limit: bool, user_format: bool) -> String {
+    render_log(output, limit, user_set_limit, user_format, false)
+}
+
+fn render_log(
+    output: &str,
+    limit: usize,
+    user_set_limit: bool,
+    user_format: bool,
+    fold: bool,
+) -> String {
+    let truncate_width = if !fold {
+        usize::MAX
+    } else if user_set_limit {
+        120
+    } else {
+        80
+    };
 
     // When user specified their own format (--oneline, --pretty, --format),
     // RTK did not inject ---END--- markers. Use simple line-based truncation.
@@ -2270,12 +2309,13 @@ pub(crate) fn filter_log_output(
             .map(|l| l.trim())
             .filter(|l| {
                 !l.is_empty()
-                    && !l.starts_with("Signed-off-by:")
-                    && !l.starts_with("Co-authored-by:")
+                    && (!fold
+                        || (!l.starts_with("Signed-off-by:") && !l.starts_with("Co-authored-by:")))
             })
             .collect();
-        let body_omitted = all_body_lines.len().saturating_sub(3);
-        let body_lines = &all_body_lines[..all_body_lines.len().min(3)];
+        let kept = if fold { 3 } else { all_body_lines.len() };
+        let body_omitted = all_body_lines.len().saturating_sub(kept);
+        let body_lines = &all_body_lines[..all_body_lines.len().min(kept)];
 
         if body_lines.is_empty() {
             result.push(header);
@@ -2296,7 +2336,7 @@ pub(crate) fn filter_log_output(
 
 /// Truncate a single line to `width` characters, appending "..." if needed
 fn truncate_line(line: &str, width: usize) -> String {
-    if line.chars().count() > width {
+    if width != usize::MAX && line.chars().count() > width {
         let truncated: String = line.chars().take(width - 3).collect();
         format!("{}...", truncated)
     } else {
@@ -5424,6 +5464,27 @@ A  added.rs
         // Test that run_passthrough compiles and has correct signature
         let _args: Vec<OsString> = vec![OsString::from("tag"), OsString::from("--list")];
         // Compile-time verification that the function exists with correct signature
+    }
+
+    #[test]
+    fn full_log_output_keeps_what_folding_drops() {
+        let long = "x".repeat(150);
+        let output = format!(
+            "abc1234 subject (1 day ago) <a>\nb1\nb2\nb3\nb4\n{long}\nSigned-off-by: A\n---END---\n"
+        );
+        let folded = filter_log_output(&output, 10, true, false);
+        let full = full_log_output(&output, 10, true, false);
+        assert!(folded.contains("[+2 lines omitted]"), "{folded}");
+        assert!(!full.contains("omitted"), "{full}");
+        for kept in ["b4", long.as_str(), "Signed-off-by: A"] {
+            assert!(full.contains(kept), "full form lost {kept:?}:\n{full}");
+        }
+        // Nothing to recover when nothing was cut.
+        let short = "abc1234 subject (1 day ago) <a>\nb1\n---END---\n";
+        assert_eq!(
+            filter_log_output(short, 10, true, false),
+            full_log_output(short, 10, true, false)
+        );
     }
 
     #[test]
