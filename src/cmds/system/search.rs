@@ -475,18 +475,68 @@ struct SearchStreamFilter {
     max_results: usize,
     shown: usize,
     cap_reported: bool,
+    /// Matches past the cap, kept so `flush` can store them behind a recall hint.
+    /// Bounded by `STREAM_OVERFLOW_MAX_BYTES` so an endless `tail -f` cannot grow it unchecked.
+    overflow: String,
+    overflow_dropped: usize,
+}
+
+/// Recall stores cap a single entry (10 MiB by default); keeping more than that is wasted memory.
+const STREAM_OVERFLOW_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+impl SearchStreamFilter {
+    fn new(show_file: bool, show_line: bool, max_results: usize) -> Self {
+        Self {
+            show_file,
+            show_line,
+            max_results,
+            shown: 0,
+            cap_reported: false,
+            overflow: String::new(),
+            overflow_dropped: 0,
+        }
+    }
+
+    fn keep_overflow(&mut self, line: &str) {
+        if self.overflow.len() + line.len() <= STREAM_OVERFLOW_MAX_BYTES {
+            self.overflow.push_str(line);
+        } else {
+            self.overflow_dropped += 1;
+        }
+    }
+
+    /// The trailing line that tells the caller how to read what the cap withheld.
+    fn overflow_hint(&self, hint: Option<String>) -> String {
+        if self.overflow.is_empty() {
+            return String::new();
+        }
+        let dropped = match self.overflow_dropped {
+            0 => String::new(),
+            n => format!(" ({n} later lines past the recall size limit were not kept)"),
+        };
+        match hint {
+            Some(hint) => format!("{hint}{dropped}\n"),
+            None => format!(
+                "[rtk] recall is off; narrow the pattern or rerun with `rtk bypass` for the rest{dropped}\n"
+            ),
+        }
+    }
 }
 
 impl StreamFilter for SearchStreamFilter {
     fn feed_line(&mut self, line: &str) -> Option<String> {
         let Some(output) = format_match_line(line, self.show_file, self.show_line) else {
-            if line == "--" && self.shown >= self.max_results {
+            if self.shown >= self.max_results {
+                // Past the cap, context lines and `--` separators belong with the
+                // matches they surround, so they go to the overflow too.
+                self.keep_overflow(&format!("{line}\n"));
                 return None;
             }
             return Some(format!("{line}\n"));
         };
 
         if self.shown >= self.max_results {
+            self.keep_overflow(&output);
             if self.cap_reported {
                 return None;
             }
@@ -502,7 +552,11 @@ impl StreamFilter for SearchStreamFilter {
     }
 
     fn flush(&mut self) -> String {
-        String::new()
+        if self.overflow.is_empty() {
+            return String::new();
+        }
+        let hint = crate::core::tee::force_tee_tail_hint(&self.overflow, "grep_stdin", 1);
+        self.overflow_hint(hint)
     }
 }
 
@@ -524,15 +578,13 @@ fn run_streaming_search(
     real_cmd: &str,
     detected_flags: DetectedFlags,
 ) -> Result<i32> {
-    let filter = SearchStreamFilter {
-        show_file: detected_flags
+    let filter = SearchStreamFilter::new(
+        detected_flags
             .show_file
             .unwrap_or_else(|| wants_show_file(paths, detected_flags.recursive)),
-        show_line: detected_flags.show_line,
+        detected_flags.show_line,
         max_results,
-        shown: 0,
-        cap_reported: false,
-    };
+    );
     let mut cmd = engine_command(engine, extra_args, patterns, paths, true);
     let result = stream::run_streaming(
         &mut cmd,
@@ -1214,13 +1266,7 @@ mod tests {
 
     #[test]
     fn streaming_search_preserves_native_shape() {
-        let mut filter = SearchStreamFilter {
-            show_file: false,
-            show_line: true,
-            max_results: 10,
-            shown: 0,
-            cap_reported: false,
-        };
+        let mut filter = SearchStreamFilter::new(false, true, 10);
 
         assert_eq!(
             filter.feed_line("engine warning"),
@@ -1234,13 +1280,7 @@ mod tests {
 
     #[test]
     fn streaming_search_reports_the_cap_once() {
-        let mut filter = SearchStreamFilter {
-            show_file: false,
-            show_line: true,
-            max_results: 1,
-            shown: 0,
-            cap_reported: false,
-        };
+        let mut filter = SearchStreamFilter::new(false, true, 1);
 
         assert_eq!(
             filter.feed_line(concat!("(standard input)\0", "1:first")),
@@ -1255,6 +1295,44 @@ mod tests {
             None
         );
         assert_eq!(filter.feed_line("--"), None);
+    }
+
+    #[test]
+    fn streaming_search_keeps_what_the_cap_withholds() {
+        let mut filter = SearchStreamFilter::new(false, true, 1);
+        filter.feed_line(concat!("(standard input)\0", "1:first"));
+        filter.feed_line(concat!("(standard input)\0", "2:second"));
+        filter.feed_line("--");
+        filter.feed_line(concat!("(standard input)\0", "3:third"));
+
+        assert_eq!(filter.overflow, "2:second\n--\n3:third\n");
+        assert_eq!(
+            filter.overflow_hint(Some("[+3 hidden: rtk recall abc123]".into())),
+            "[+3 hidden: rtk recall abc123]\n"
+        );
+        assert!(filter.overflow_hint(None).contains("rtk bypass"));
+    }
+
+    #[test]
+    fn streaming_search_under_the_cap_adds_nothing() {
+        let mut filter = SearchStreamFilter::new(false, true, 5);
+        filter.feed_line(concat!("(standard input)\0", "1:only"));
+        assert_eq!(filter.flush(), "");
+    }
+
+    #[test]
+    fn streaming_search_overflow_is_bounded() {
+        let mut filter = SearchStreamFilter::new(false, false, 0);
+        let big = "x".repeat(STREAM_OVERFLOW_MAX_BYTES);
+        filter.keep_overflow(&big);
+        filter.keep_overflow("one more\n");
+        assert_eq!(filter.overflow.len(), STREAM_OVERFLOW_MAX_BYTES);
+        assert_eq!(filter.overflow_dropped, 1);
+        assert!(
+            filter
+                .overflow_hint(Some("[hint]".into()))
+                .contains("1 later lines past the recall size limit")
+        );
     }
 
     #[test]
