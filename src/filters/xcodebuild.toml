@@ -1,97 +1,103 @@
 [filters.xcodebuild]
-description = "Compact xcodebuild output — strip build phases, keep errors/warnings/summary"
-match_command = "^xcodebuild\\b"
+description = "Compact xcodebuild build/test output — keep diagnostics, failures and the verdict"
+# Build actions only. Informational calls (-list, -version, -showsdks, -showBuildSettings,
+# -showdestinations) print data the caller asked for and must not pass through an allow-list.
+match_command = "^xcodebuild\\b.*\\s(build|test|archive|analyze|clean|build-for-testing|test-without-building|docbuild|install)(\\s|$)"
 strip_ansi = true
-strip_lines_matching = [
-  "^\\s*$",
-  "^CompileC\\s",
-  "^CompileSwift\\s",
-  "^Ld\\s",
-  "^CreateBuildDirectory\\s",
-  "^MkDir\\s",
-  "^ProcessInfoPlistFile\\s",
-  "^CopySwiftLibs\\s",
-  "^CodeSign\\s",
-  "^Signing Identity:",
-  "^RegisterWithLaunchServices",
-  "^Validate\\s",
-  "^ProcessProductPackaging",
-  "^Touch\\s",
-  "^LinkStoryboards",
-  "^CompileStoryboard",
-  "^CompileAssetCatalog",
-  "^GenerateDSYMFile",
-  "^PhaseScriptExecution",
-  "^PBXCp\\s",
-  "^SetMode\\s",
-  "^SetOwnerAndGroup\\s",
-  "^Ditto\\s",
-  "^CpResource\\s",
-  "^CpHeader\\s",
-  "^\\s+cd\\s+/",
-  "^\\s+export\\s",
-  "^\\s+/Applications/Xcode",
-  "^\\s+/usr/bin/",
-  "^\\s+builtin-",
-  "^note: Using new build system",
+# An allow-list, not a strip-list: modern Xcode prints hundreds of step kinds (SwiftCompile,
+# SwiftDriver, SwiftEmitModule, SwiftExplicitDependencyGeneratePcm, ProcessXCFramework,
+# WriteAuxiliaryFile, ...) and a strip-list that missed them filled the line cap with steps
+# and dropped the errors and the `** BUILD FAILED **` verdict that come last.
+keep_lines_matching = [
+  "(^|\\s)(fatal )?error:",
+  ": warning: ",
+  "^\\*\\* .* \\*\\*\\s*$",
+  "^The following build commands failed:",
+  "^Failing tests:",
+  "^\\t\\S",
+  "^✘",
+  "^↳",
+  "^Test Case .* failed",
+  "^Test Suite .* failed at",
+  "^Executed \\d+ tests?, with",
+  "Test run with \\d+ tests?",
+  "^ld: ",
+  "^Undefined symbols",
+  "Command \\S+ failed with a nonzero exit code",
+  "^Testing failed:",
 ]
-max_lines = 60
+truncate_lines_at = 400
+# The first errors and the closing summary (failed commands, failing tests, verdict) both
+# matter; anything cut in between stays recoverable through the recall hint.
+head_lines = 70
+tail_lines = 30
 on_empty = "xcodebuild: ok"
 
 [[tests.xcodebuild]]
-name = "strips build phases, keeps errors and summary"
+name = "keeps diagnostics and the verdict, drops modern build steps"
+input = """
+Command line invocation:
+    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -scheme App build
+ComputePackagePrebuildTargetDependencyGraph
+SwiftExplicitDependencyGeneratePcm arm64 /var/folders/x/T/dd/SDKExplicitPrecompiledModules/Foundation.pcm
+SwiftDriver App normal arm64 com.apple.xcode.tools.swift.compiler (in target 'App' from project 'App')
+    cd /Users/dev/App
+SwiftCompile normal arm64 /Users/dev/App/ViewController.swift (in target 'App' from project 'App')
+/Users/dev/App/ViewController.swift:42:9: error: cannot find 'foo' in scope
+/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used
+SwiftEmitModule normal arm64 Emitting\\ module\\ for\\ App (in target 'App' from project 'App')
+
+The following build commands failed:
+	SwiftCompile normal arm64 /Users/dev/App/ViewController.swift (in target 'App' from project 'App')
+(1 failure)
+
+** BUILD FAILED **
+"""
+expected = "/Users/dev/App/ViewController.swift:42:9: error: cannot find 'foo' in scope\n/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used\nThe following build commands failed:\n\tSwiftCompile normal arm64 /Users/dev/App/ViewController.swift (in target 'App' from project 'App')\n** BUILD FAILED **"
+
+[[tests.xcodebuild]]
+name = "successful build reduces to the verdict"
 input = """
 note: Using new build system
 CompileSwift normal arm64 /Users/dev/App/ViewController.swift
     cd /Users/dev/App
-    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -c
-CompileSwift normal arm64 /Users/dev/App/AppDelegate.swift
-    cd /Users/dev/App
-    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 Ld /Users/dev/Build/Products/Debug/App normal arm64
-    cd /Users/dev/App
-    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang
 CodeSign /Users/dev/Build/Products/Debug/App.app
-    cd /Users/dev/App
-    builtin-codesign --force --sign
-
-/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'
-/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used
-
-** BUILD FAILED **
-"""
-expected = "/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'\n/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used\n** BUILD FAILED **"
-
-[[tests.xcodebuild]]
-name = "clean build success"
-input = """
-note: Using new build system
-CompileSwift normal arm64 /Users/dev/App/Main.swift
-    cd /Users/dev/App
-Ld /Users/dev/Build/Products/Debug/App normal arm64
-    cd /Users/dev/App
-CodeSign /Users/dev/Build/Products/Debug/App.app
-    cd /Users/dev/App
-    builtin-codesign --force --sign
 
 ** BUILD SUCCEEDED **
 """
 expected = "** BUILD SUCCEEDED **"
 
 [[tests.xcodebuild]]
-name = "test output keeps test results"
+name = "XCTest keeps failures and the count, not passing cases"
 input = """
-note: Using new build system
-CompileSwift normal arm64 /Users/dev/AppTests/Tests.swift
-    cd /Users/dev/App
 Test Suite 'All tests' started at 2026-03-10 12:00:00
 Test Suite 'AppTests' started at 2026-03-10 12:00:00
 Test Case '-[AppTests testExample]' passed (0.001 seconds).
+/Users/dev/AppTests/Tests.swift:12: error: -[AppTests testFailing] : XCTAssertEqual failed: ("1") is not equal to ("2")
 Test Case '-[AppTests testFailing]' failed (0.002 seconds).
-Test Suite 'AppTests' passed at 2026-03-10 12:00:01
+Test Suite 'AppTests' failed at 2026-03-10 12:00:01
 Executed 2 tests, with 1 failure in 0.003 seconds
+** TEST FAILED **
 """
-expected = "Test Suite 'All tests' started at 2026-03-10 12:00:00\nTest Suite 'AppTests' started at 2026-03-10 12:00:00\nTest Case '-[AppTests testExample]' passed (0.001 seconds).\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' passed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds"
+expected = "/Users/dev/AppTests/Tests.swift:12: error: -[AppTests testFailing] : XCTAssertEqual failed: (\"1\") is not equal to (\"2\")\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' failed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds\n** TEST FAILED **"
+
+[[tests.xcodebuild]]
+name = "Swift Testing keeps issues, their details and the failing-tests list"
+input = """
+◇ Test run started.
+✔ Test parsesHeader() passed after 0.010 seconds.
+✘ Test appCatalogIsTranslated() recorded an issue at LocalizationGuardTests.swift:184:9: Expectation failed: offenders.isEmpty
+↳ offenders.isEmpty → false
+✘ Test appCatalogIsTranslated() failed after 0.508 seconds with 1 issue.
+✘ Test run with 20 tests in 2 suites failed after 1.419 seconds with 1 issue.
+
+Failing tests:
+	LocalizationGuardTests.appCatalogIsTranslated()
+
+** TEST FAILED **
+"""
+expected = "✘ Test appCatalogIsTranslated() recorded an issue at LocalizationGuardTests.swift:184:9: Expectation failed: offenders.isEmpty\n↳ offenders.isEmpty → false\n✘ Test appCatalogIsTranslated() failed after 0.508 seconds with 1 issue.\n✘ Test run with 20 tests in 2 suites failed after 1.419 seconds with 1 issue.\nFailing tests:\n\tLocalizationGuardTests.appCatalogIsTranslated()\n** TEST FAILED **"
 
 [[tests.xcodebuild]]
 name = "empty input returns on_empty message"
