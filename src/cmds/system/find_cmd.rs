@@ -38,7 +38,22 @@ struct FindArgs {
     max_explicit: bool,
     max_depth: Option<usize>,
     file_type: String,
+    /// `-type`/`-t` appeared in the command (not just the default).
+    type_explicit: bool,
     case_insensitive: bool,
+}
+
+/// `file_type` value meaning "files and directories alike" — what find itself
+/// matches when the command names no `-type`.
+const TYPE_ANY: &str = "any";
+
+/// `Some(true)` = directories only, `Some(false)` = files only, `None` = both.
+fn type_filter(file_type: &str) -> Option<bool> {
+    match file_type {
+        "d" => Some(true),
+        "f" => Some(false),
+        _ => None,
+    }
 }
 
 impl Default for FindArgs {
@@ -50,6 +65,7 @@ impl Default for FindArgs {
             max_explicit: false,
             max_depth: None,
             file_type: "f".to_string(),
+            type_explicit: false,
             case_insensitive: false,
         }
     }
@@ -104,11 +120,17 @@ fn leading_options_len(args: &[String]) -> usize {
 
 /// The subset rtk walks itself: one path, each of -name/-iname (globs with * and ?
 /// only), -type f|d, -maxdepth N, -m/--max N, -t/--file-type f|d at most once.
-fn parse_subset(paths: &[String], expr: &[String]) -> Option<FindArgs> {
+///
+/// With no `-type`, find syntax matches files and directories alike, exactly as
+/// find does; only rtk's own `find <glob>` shorthand (`legacy`) defaults to files.
+fn parse_subset(paths: &[String], expr: &[String], legacy: bool) -> Option<FindArgs> {
     if paths.len() > 1 {
         return None;
     }
     let mut parsed = FindArgs::default();
+    if !legacy {
+        parsed.file_type = TYPE_ANY.to_string();
+    }
     if let Some(p) = paths.first() {
         parsed.path = p.clone();
     }
@@ -127,6 +149,7 @@ fn parse_subset(paths: &[String], expr: &[String]) -> Option<FindArgs> {
             }
             "-type" | "-t" | "--file-type" if !seen_type && (value == "f" || value == "d") => {
                 parsed.file_type = value.clone();
+                parsed.type_explicit = true;
                 seen_type = true;
             }
             "-maxdepth" if !seen_depth => {
@@ -179,11 +202,10 @@ fn dispatch(original: &[String]) -> Result<Dispatch> {
         return Ok(Dispatch::Verbatim(verbatim));
     }
     if options.is_empty()
-        && let Some(mut parsed) = parse_subset(&paths, &expr)
+        && let Some(mut parsed) = parse_subset(&paths, &expr, legacy)
     {
         let repeated_max = max.is_some() && parsed.max_explicit;
-        let repeated_type =
-            file_type.is_some() && parsed.file_type != FindArgs::default().file_type;
+        let repeated_type = file_type.is_some() && parsed.type_explicit;
         if !repeated_max && !repeated_type {
             if let Some(n) = max {
                 parsed.max_results = n;
@@ -437,7 +459,7 @@ pub fn run(
         eprintln!("find: {} in {}", effective_pattern, path);
     }
 
-    let want_dirs = file_type == "d";
+    let want_dirs = type_filter(file_type);
 
     if !Path::new(path).exists() {
         eprintln!("find: '{}': No such file or directory", path);
@@ -477,7 +499,7 @@ fn native_walk(
     path: &str,
     pattern: &str,
     max_depth: Option<usize>,
-    want_dirs: bool,
+    want_dirs: Option<bool>,
     case_insensitive: bool,
     ambient_ignores: bool,
 ) -> (Vec<String>, Vec<String>) {
@@ -527,7 +549,7 @@ fn native_walk(
     }
 
     let filtered = if disclose {
-        disclose_filtered(
+        let (matched, filtered) = disclose_filtered(
             path,
             pattern,
             max_depth,
@@ -535,7 +557,9 @@ fn native_walk(
             case_insensitive,
             &visited_dirs,
             &visited,
-        )
+        );
+        files.extend(matched);
+        filtered
     } else {
         Vec::new()
     };
@@ -546,11 +570,11 @@ fn entry_display(
     entry: &ignore::DirEntry,
     root: &str,
     pattern: &str,
-    want_dirs: bool,
+    want_dirs: Option<bool>,
     case_insensitive: bool,
 ) -> Option<String> {
     let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-    if want_dirs != is_dir {
+    if want_dirs.is_some_and(|dirs| dirs != is_dir) {
         return None;
     }
     let name = entry.path().file_name()?.to_string_lossy();
@@ -575,12 +599,15 @@ fn name_matches(pattern: &str, name: &str, case_insensitive: bool) -> bool {
     }
 }
 
-fn relative_display(entry_path: &Path, root: &str) -> String {
-    entry_path
-        .strip_prefix(root)
-        .unwrap_or(entry_path)
-        .to_string_lossy()
-        .to_string()
+/// The path as find prints it, minus a leading `./`: one that opens from where
+/// the command ran. Paths relative to the search root (`ARCHITECTURE.md` for
+/// `find Docs ...`) looked tidier but could not be opened.
+fn relative_display(entry_path: &Path, _root: &str) -> String {
+    let shown = entry_path.to_string_lossy();
+    match shown.strip_prefix("./") {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => shown.to_string(),
+    }
 }
 
 const FILTERED_CAP: usize = 1000;
@@ -590,11 +617,12 @@ fn disclose_filtered(
     root: &str,
     pattern: &str,
     max_depth: Option<usize>,
-    want_dirs: bool,
+    want_dirs: Option<bool>,
     case_insensitive: bool,
     visited_dirs: &[(std::path::PathBuf, usize)],
     visited: &HashSet<std::path::PathBuf>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
+    let mut matched = Vec::new();
     let mut out = Vec::new();
     for (dir, depth) in visited_dirs {
         if max_depth.is_some_and(|max| *depth >= max) {
@@ -611,22 +639,27 @@ fn disclose_filtered(
             let name = child.file_name().to_string_lossy().into_owned();
             let is_dir = child.file_type().is_ok_and(|t| t.is_dir());
             let display = relative_display(&child_path, root);
+            // An ignored entry that is itself a match is what find would print:
+            // it joins the results rather than hiding behind the filtered note.
+            let type_ok = want_dirs.is_none_or(|dirs| dirs == is_dir);
+            if type_ok && name_matches(pattern, &name, case_insensitive) {
+                matched.push(display.clone());
+            }
             if is_dir {
                 if name == UNREPORTED_DIR {
                     continue;
                 }
+                // Its contents were not searched.
                 out.push(format!("{}/", display));
-            } else if !want_dirs && name_matches(pattern, &name, case_insensitive) {
-                out.push(display);
             }
             if out.len() >= FILTERED_CAP {
                 out.sort();
-                return out;
+                return (matched, out);
             }
         }
     }
     out.sort();
-    out
+    (matched, out)
 }
 
 fn filtered_hint(filtered: &[String]) -> Option<String> {
@@ -690,19 +723,9 @@ fn render(
         }
 
         let files_in_dir = &by_dir[dir];
-        let dir_display = if dir.chars().count() > 50 {
-            let tail: String = dir
-                .chars()
-                .rev()
-                .take(47)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            format!("...{}", tail)
-        } else {
-            dir.clone()
-        };
+        // The whole directory, never a `...tail`: a shortened path cannot be
+        // used, and nothing else in the output carries the missing prefix.
+        let dir_display = dir.clone();
 
         let remaining_budget = max_results - displayed;
         if files_in_dir.len() <= remaining_budget {
@@ -1088,7 +1111,9 @@ mod tests {
         let parsed = parse_find_args(&args(&[".", "-name", "*.rs"])).unwrap();
         assert_eq!(parsed.pattern, "*.rs");
         assert_eq!(parsed.path, ".");
-        assert_eq!(parsed.file_type, "f");
+        // find syntax with no -type matches files and directories, like find.
+        assert_eq!(parsed.file_type, TYPE_ANY);
+        assert!(!parsed.type_explicit);
         assert_eq!(parsed.max_results, 50);
     }
 
@@ -1449,7 +1474,7 @@ mod tests {
                             &parsed.path,
                             &parsed.pattern,
                             parsed.max_depth,
-                            parsed.file_type == "d",
+                            type_filter(&parsed.file_type),
                             parsed.case_insensitive,
                             true,
                         );
@@ -1555,23 +1580,21 @@ mod tests {
         std::fs::write(root.join("build").join("out.txt"), "w").unwrap();
         let root_s = root.to_string_lossy().into_owned();
 
-        let (files, filtered) = native_walk(&root_s, "*.txt", None, false, false, false);
-        assert_eq!(files, vec!["visible.txt".to_string()]);
-        assert_eq!(
-            filtered,
-            vec![
-                ".hidden/".to_string(),
-                "build/".to_string(),
-                "secret.txt".to_string()
-            ]
-        );
+        let at = |rel: &str| format!("{root_s}/{rel}");
+        let (mut files, filtered) =
+            native_walk(&root_s, "*.txt", None, Some(false), false, false);
+        files.sort();
+        // An ignored file that matches is a result, as it is for find; only the
+        // folders whose contents went unsearched stay behind the note.
+        assert_eq!(files, vec![at("secret.txt"), at("visible.txt")]);
+        assert_eq!(filtered, vec![at(".hidden/"), at("build/")]);
 
-        let (_, filtered) = native_walk(&root_s, "*.txt", Some(0), false, false, false);
+        let (_, filtered) = native_walk(&root_s, "*.txt", Some(0), Some(false), false, false);
         assert!(filtered.is_empty(), "{filtered:?}");
 
-        let (files, filtered) = native_walk(&root_s, ".gitignore", None, false, false, false);
-        assert_eq!(files, vec![".gitignore".to_string()]);
-        assert_eq!(filtered, vec!["build/".to_string()]);
+        let (files, filtered) = native_walk(&root_s, ".gitignore", None, Some(false), false, false);
+        assert_eq!(files, vec![at(".gitignore")]);
+        assert_eq!(filtered, vec![at("build/")]);
     }
 
     #[test]
@@ -1612,9 +1635,9 @@ mod tests {
         std::fs::write(root.join("sub").join(".hidden").join("h.txt"), "h").unwrap();
         std::os::unix::fs::symlink(root.join("sub"), root.join("link")).unwrap();
         let link = root.join("link").to_string_lossy().into_owned();
-        let (files, filtered) = native_walk(&link, "*.txt", None, false, false, false);
-        assert_eq!(files, vec!["a.txt".to_string()]);
-        assert_eq!(filtered, vec![".hidden/".to_string()]);
+        let (files, filtered) = native_walk(&link, "*.txt", None, Some(false), false, false);
+        assert_eq!(files, vec![format!("{link}/a.txt")]);
+        assert_eq!(filtered, vec![format!("{link}/.hidden/")]);
     }
 
     #[test]
@@ -1622,5 +1645,77 @@ mod tests {
         assert!(filtered_hint(&[]).is_none());
         let h = filtered_hint(&["secret.txt".to_string(), ".hidden/h.txt".to_string()]).unwrap();
         assert!(h.starts_with("... (2 filtered"), "{h}");
+    }
+
+    // --- v2: find syntax without -type keeps directories (jacob/custom) ---
+
+    #[test]
+    fn legacy_glob_shorthand_still_defaults_to_files() {
+        let parsed = parse_find_args(&args(&["*.rs", "src"])).unwrap();
+        assert_eq!(parsed.file_type, "f");
+        assert!(!parsed.type_explicit);
+    }
+
+    #[test]
+    fn trailing_rtk_type_flag_after_find_syntax_still_applies() {
+        let parsed = parse_find_args(&args(&[".", "-name", "*.app", "-t", "d"])).unwrap();
+        assert_eq!(parsed.file_type, "d");
+    }
+
+    #[test]
+    fn explicit_type_and_trailing_type_conflict_goes_to_find() {
+        assert_eq!(class(&[".", "-name", "x", "-type", "f", "-t", "d"]), "compress");
+    }
+
+    #[test]
+    fn find_syntax_without_type_lists_matching_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("Build/Demo.app/Contents")).unwrap();
+        std::fs::write(root.join("Build/Demo.app/Contents/Info.plist"), "x").unwrap();
+        std::fs::write(root.join("Build/notes.app"), "x").unwrap();
+        let root_s = root.to_string_lossy().to_string();
+
+        let parsed = parse_find_args(&args(&[&root_s, "-name", "*.app"])).unwrap();
+        let (files, _) = native_walk(
+            &parsed.path,
+            &parsed.pattern,
+            parsed.max_depth,
+            type_filter(&parsed.file_type),
+            parsed.case_insensitive,
+            false,
+        );
+        let mut files = files;
+        files.sort();
+        let want: Vec<String> = ["Build/Demo.app", "Build/notes.app"]
+            .iter()
+            .map(|rel| format!("{root_s}/{rel}"))
+            .collect();
+        assert_eq!(files, want, "{files:?}");
+
+        let (dirs_only, _) = native_walk(&root_s, "*.app", None, Some(true), false, false);
+        assert_eq!(dirs_only.len(), 1, "{dirs_only:?}");
+        let (files_only, _) = native_walk(&root_s, "*.app", None, Some(false), false, false);
+        assert_eq!(files_only.len(), 1, "{files_only:?}");
+    }
+
+    #[test]
+    fn long_directory_names_are_never_shortened() {
+        let dir = "a/very/long/directory/path/that/is/well/over/fifty/characters/deep";
+        let files: Vec<String> = (0..12).map(|i| format!("{dir}/file{i}.txt")).collect();
+        let raw = files.join("\n");
+        let timer = tracking::TimedExecution::start();
+        let shown = render(files, 50, false, &[], "find . -name '*.txt'", &raw, &timer);
+        assert!(shown.contains(&format!("{dir}/ file0.txt")), "{shown}");
+        assert!(!shown.contains("..."), "{shown}");
+    }
+
+    #[test]
+    fn results_keep_the_search_root_so_they_open_from_cwd() {
+        let shown = |p: &str, root: &str| relative_display(Path::new(p), root);
+        assert_eq!(shown("Docs/ARCHITECTURE.md", "Docs"), "Docs/ARCHITECTURE.md");
+        assert_eq!(shown("./Docs/ARCHITECTURE.md", "."), "Docs/ARCHITECTURE.md");
+        assert_eq!(shown("/abs/Docs/x.md", "/abs/Docs"), "/abs/Docs/x.md");
+        assert_eq!(shown(".", "."), ".");
     }
 }
