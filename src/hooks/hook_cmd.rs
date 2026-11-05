@@ -784,7 +784,12 @@ fn process_claude_payload_from_decision(
 /// touching the tracking DB.
 fn hook_log_fields(v: &Value) -> Option<(&str, &str, &str)> {
     let session_id = v.get("session_id").and_then(|s| s.as_str())?;
-    let tool_use_id = v.get("tool_use_id").and_then(|s| s.as_str())?;
+    // Codex names the call `tool_use_id` like Claude Code; older Codex payloads
+    // carried only `turn_id`, which still joins the row to its session.
+    let tool_use_id = v
+        .get("tool_use_id")
+        .or_else(|| v.get("turn_id"))
+        .and_then(|s| s.as_str())?;
     let project_path = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
     Some((session_id, tool_use_id, project_path))
 }
@@ -1088,17 +1093,27 @@ pub fn run_codex() -> Result<()> {
         }
     };
 
+    // Logged like the Claude hook (response first, the best-effort row last):
+    // without these rows nothing shows whether Codex runs this hook at all.
     match process_codex_payload(&v) {
         PayloadAction::Rewrite {
             cmd,
             rewritten,
             output,
-            ..
+            decision,
         } => {
-            audit_log("rewrite", &cmd, &rewritten);
             let _ = writeln!(io::stdout(), "{output}");
+            audit_log("rewrite", &cmd, &rewritten);
+            log_hook_decision(&v, &cmd, decision, Some(&rewritten));
         }
-        PayloadAction::Skip { cmd, reason, .. } => audit_log(reason, &cmd, ""),
+        PayloadAction::Skip {
+            cmd,
+            reason,
+            decision,
+        } => {
+            audit_log(reason, &cmd, "");
+            log_hook_decision(&v, &cmd, decision, None);
+        }
         PayloadAction::Ignore => {}
     }
 
@@ -2027,6 +2042,18 @@ mod tests {
             "tool_input": { "command": "git status" }
         });
         assert!(hook_log_fields(&v).is_none());
+    }
+
+    #[test]
+    fn test_hook_log_fields_falls_back_to_codex_turn_id() {
+        let v = json!({
+            "session_id": "01a1a8b2-339a",
+            "turn_id": "01a1a8b2-374b",
+            "tool_name": "Bash",
+            "tool_input": { "command": "git status" }
+        });
+        let (session_id, tool_use_id, _) = hook_log_fields(&v).unwrap();
+        assert_eq!((session_id, tool_use_id), ("01a1a8b2-339a", "01a1a8b2-374b"));
     }
 
     #[test]
