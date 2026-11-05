@@ -853,11 +853,12 @@ pub fn run(
         let Some((file, line_num, is_match, content)) = parse_match_line(line) else {
             continue;
         };
-        let cleaned = clean_line(content, max_line_len, context_re.as_ref(), &pattern_display);
+        // Keep the whole line: it is shortened only where it is displayed, so
+        // the recall blocks below hold what grep printed, not a `...` slice.
         by_file
             .entry(file)
             .or_default()
-            .push((line_num, is_match, cleaned));
+            .push((line_num, is_match, content.to_string()));
     }
 
     let total_matches: usize = by_file
@@ -902,6 +903,9 @@ pub fn run(
     let mut shown = 0;
     let mut skipped_files = 0;
     let mut skipped_block = String::new();
+    // Full text of every displayed line that was shortened, for one recall hint.
+    let mut shortened_block = String::new();
+    let mut shortened = 0usize;
     for (idx, (file, entries)) in files.into_iter().enumerate() {
         if shown >= max_results {
             skipped_files += 1;
@@ -909,7 +913,8 @@ pub fn run(
             continue;
         }
 
-        let file_display = compact_path(file);
+        // The real path, never `a/.../x/y`: a shortened path cannot be opened.
+        let file_display = file.as_str();
         let mut file_shown = 0;
         let mut prev_line: usize = 0;
         for (line_num, is_match, content) in entries.iter().take(per_file) {
@@ -922,14 +927,22 @@ pub fn run(
             prev_line = *line_num;
             let sep = if *is_match { ':' } else { '-' };
             if show_file {
-                body.push_str(&file_display);
+                body.push_str(file_display);
                 body.push(sep);
             }
             if show_line {
                 body.push_str(&line_num.to_string());
                 body.push(sep);
             }
-            body.push_str(content);
+            let cleaned = clean_line(content, max_line_len, context_re.as_ref(), &pattern_display);
+            if cleaned != content.trim() {
+                shortened += 1;
+                shortened_block.push_str(&match_block(
+                    file,
+                    &[(*line_num, *is_match, content.clone())],
+                ));
+            }
+            body.push_str(&cleaned);
             body.push('\n');
             shown += 1;
             file_shown += 1;
@@ -953,6 +966,13 @@ pub fn run(
             )),
             None => body.push_str(&format!("  +{} more in {}\n", remaining, file_display)),
         }
+    }
+
+    if shortened > 0
+        && let Some(hint) = crate::core::tee::force_tee_hint(&shortened_block, "grep_long_lines")
+    {
+        let hint = hint.replacen("[full output:", "[full lines:", 1);
+        body.push_str(&format!("{shortened} long lines shortened {hint}\n"));
     }
 
     if skipped_files > 0 {
@@ -1227,24 +1247,6 @@ fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &
     }
 }
 
-fn compact_path(path: &str) -> String {
-    if path.len() <= 50 {
-        return path.to_string();
-    }
-
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() <= 3 {
-        return path.to_string();
-    }
-
-    format!(
-        "{}/.../{}/{}",
-        parts[0],
-        parts[parts.len() - 2],
-        parts[parts.len() - 1]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,13 +1257,6 @@ mod tests {
         let cleaned = clean_line(line, 50, None, "result");
         assert!(!cleaned.starts_with(' '));
         assert!(cleaned.len() <= 50);
-    }
-
-    #[test]
-    fn test_compact_path() {
-        let path = "/Users/patrick/dev/project/src/components/Button.tsx";
-        let compact = compact_path(path);
-        assert!(compact.len() <= 60);
     }
 
     #[test]
