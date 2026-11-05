@@ -12,6 +12,9 @@ keep_lines_matching = [
   "(^|\\s)(fatal )?error:",
   ": warning: ",
   "^\\*\\* .* \\*\\*\\s*$",
+  # The verdict glued onto the end of an interleaved line (a crash backtrace on stderr
+  # written without its newline), e.g. ` 12   -[Xcode3Comman** BUILD INTERRUPTED **`.
+  "\\*\\* (BUILD|TEST|ARCHIVE|ANALYZE|CLEAN|INSTALL|EXPORT|DOCBUILD)[A-Z -]* \\*\\*\\s*$",
   "^The following build commands failed:",
   "^Failing tests:",
   "^\\t\\S",
@@ -103,3 +106,21 @@ expected = "✘ Test appCatalogIsTranslated() recorded an issue at LocalizationG
 name = "empty input returns on_empty message"
 input = ""
 expected = "xcodebuild: ok"
+
+[[tests.xcodebuild]]
+name = "keeps a verdict glued onto the end of a backtrace line"
+input = """
+CompileSwift normal arm64 /Users/dev/App/ViewController.swift
+2026-09-20 12:06:59.431 xcodebuild[123:456] Writing error result bundle
+ 11   -[IDEBuildOperation _buildOperationDidStop]
+ 12   -[Xcode3Comman** BUILD INTERRUPTED **
+"""
+expected = " 12   -[Xcode3Comman** BUILD INTERRUPTED **"
+
+[[tests.xcodebuild]]
+name = "does not keep prose that merely contains asterisks"
+input = """
+note: see ** the docs ** for details
+** BUILD SUCCEEDED **
+"""
+expected = "** BUILD SUCCEEDED **"
