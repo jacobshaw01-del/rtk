@@ -432,7 +432,11 @@ fn run_diff(
     }
 
     let printed = if !diff_result.stdout.is_empty() {
-        let compacted = compact_diff(&strip_ansi(&diff_result.stdout), max_lines.unwrap_or(500));
+        let compacted = compact_diff_with_recall(
+            &strip_ansi(&diff_result.stdout),
+            max_lines.unwrap_or(500),
+            "git-diff",
+        );
         format!("{}\n\nChanges:\n{}", result.stdout.trim(), compacted)
     } else {
         result.stdout.trim().to_string()
@@ -768,7 +772,8 @@ fn run_show(
         if verbose > 0 {
             printed.push_str("\n\nChanges:");
         }
-        let compacted = compact_diff(&strip_ansi(diff_text), max_lines.unwrap_or(500));
+        let compacted =
+            compact_diff_with_recall(&strip_ansi(diff_text), max_lines.unwrap_or(500), "git-show");
         printed.push('\n');
         printed.push_str(&compacted);
     }
@@ -1509,10 +1514,29 @@ pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
     }
 
     if was_truncated {
-        result.push("[full diff: rtk git diff --no-compact]".to_string());
+        result.push(FULL_DIFF_RERUN_HINT.to_string());
     }
 
     result.join("\n")
+}
+
+/// The trailer `compact_diff` ends a cut diff with.
+pub(crate) const FULL_DIFF_RERUN_HINT: &str = "[full diff: rtk git diff --no-compact]";
+
+/// `compact_diff`, but a cut diff points at a recall entry holding the whole
+/// diff rather than at a rerun. Agents rarely rerun (16 of 16 cut diffs in a
+/// 2026-11 replay were never re-fetched), and a rerun can no longer show the
+/// same diff once the tree has moved. Falls back to the rerun hint whenever
+/// the recall store is unavailable.
+pub(crate) fn compact_diff_with_recall(diff: &str, max_lines: usize, slug: &str) -> String {
+    let compacted = compact_diff(diff, max_lines);
+    let Some(head) = compacted.strip_suffix(FULL_DIFF_RERUN_HINT) else {
+        return compacted;
+    };
+    match crate::core::tee::force_tee_hint(diff, slug) {
+        Some(hint) => format!("{head}{}", hint.replacen("[full output:", "[full diff:", 1)),
+        None => compacted,
+    }
 }
 
 /// RTK's default `git log` limit, applied whenever the user names none.
@@ -3499,7 +3523,7 @@ fn run_stash(
             // itself, but hands the rest to the revision machinery, which does consume a
             // following `--word-diff` as `--author`'s value.
             let filtered = if patch_mode && !emits_word_diff(&tokenize_git_log_args(args)) {
-                compact_diff(&result.stdout, 100)
+                compact_diff_with_recall(&result.stdout, 100, "git-stash-show")
             } else if patch_mode {
                 result.stdout.clone()
             } else {
@@ -7157,5 +7181,38 @@ To https://github.com/foo/bar.git
         // behind it.
         assert!(probe_args(&["-p", "--line-prefix=zz"]).is_empty());
         assert!(probe_args(&["-p", "--line-prefix", "zz"]).is_empty());
+    }
+
+    // --- v2: a cut diff points at a recall entry (jacob/custom) ---
+
+    #[test]
+    fn cut_diff_points_at_a_recall_entry_holding_the_whole_diff() {
+        let mut diff = String::from("diff --git a/big.txt b/big.txt\n--- a/big.txt\n+++ b/big.txt\n@@ -0,0 +1,150 @@\n");
+        for i in 0..150 {
+            diff.push_str(&format!("+line {i}\n"));
+        }
+        let home = crate::core::test_isolation::tempdir();
+        let (out, recalled) = crate::core::test_isolation::with_root(home.path(), || {
+            let out = compact_diff_with_recall(&diff, 500, "git-diff");
+            let hash = out
+                .lines()
+                .last()
+                .and_then(|l| l.strip_prefix("[full diff: rtk recall "))
+                .map(|rest| rest.trim_end_matches(']').to_string());
+            let recalled = hash.and_then(|h| crate::core::retriever::recalled_content(&h));
+            (out, recalled)
+        });
+        assert!(!out.contains("--no-compact"), "{out}");
+        assert!(out.contains("+line 99"), "{out}");
+        assert!(!out.contains("+line 100\n"), "{out}");
+        assert_eq!(recalled.as_deref(), Some(diff.as_str()), "{out}");
+    }
+
+    #[test]
+    fn uncut_diff_gets_no_recall_hint() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+        let out = compact_diff_with_recall(diff, 500, "git-diff");
+        assert!(!out.contains("rtk recall"), "{out}");
+        assert!(!out.contains("--no-compact"), "{out}");
     }
 }
