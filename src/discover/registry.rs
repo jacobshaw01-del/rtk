@@ -1114,6 +1114,8 @@ struct PipelineAnalysis {
     next_clause_offset: Option<usize>,
     final_stage_start: Option<usize>,
     all_consumers_safe: bool,
+    /// Some consumer is `tail`, which keeps the END of the producer's output.
+    feeds_tail: bool,
 }
 
 fn analyze_pipeline(
@@ -1136,6 +1138,12 @@ fn analyze_pipeline(
     let mut final_stage_start = None;
     let mut has_supported_structure = true;
     let mut consumers_all_safe = true;
+    let mut feeds_tail = false;
+    let mut note_consumer = |stage: &str| {
+        if shell_split(stage).first().is_some_and(|head| head == "tail") {
+            feeds_tail = true;
+        }
+    };
 
     for (i, token) in tokens.iter().enumerate() {
         if token.offset >= end_offset {
@@ -1157,10 +1165,12 @@ fn analyze_pipeline(
         if cmd[stage_start..token.offset].trim().is_empty() || kind == PipeKind::StdoutAndStderr {
             has_supported_structure = false;
         }
-        if token.offset > first_pipe_offset
-            && !is_safe_pipe_consumer(cmd[stage_start..token.offset].trim())
-        {
-            consumers_all_safe = false;
+        if token.offset > first_pipe_offset {
+            let stage = cmd[stage_start..token.offset].trim();
+            note_consumer(stage);
+            if !is_safe_pipe_consumer(stage) {
+                consumers_all_safe = false;
+            }
         }
 
         stage_start = token.offset + token.value.len();
@@ -1169,8 +1179,12 @@ fn analyze_pipeline(
 
     if cmd[stage_start..end_offset].trim().is_empty() {
         has_supported_structure = false;
-    } else if !is_safe_pipe_consumer(cmd[stage_start..end_offset].trim()) {
-        consumers_all_safe = false;
+    } else {
+        let stage = cmd[stage_start..end_offset].trim();
+        note_consumer(stage);
+        if !is_safe_pipe_consumer(stage) {
+            consumers_all_safe = false;
+        }
     }
 
     PipelineAnalysis {
@@ -1182,6 +1196,7 @@ fn analyze_pipeline(
             None
         },
         all_consumers_safe: has_supported_structure && consumers_all_safe,
+        feeds_tail,
     }
 }
 
@@ -1249,11 +1264,16 @@ fn rewrite_pipeline_producer(
         return None;
     }
 
+    let context = if analysis.feeds_tail {
+        RewriteContext::PipelineProducerForTail
+    } else {
+        RewriteContext::PipelineProducer
+    };
     rewrite_pipeline_stage(
         cmd,
         segment_start,
         first_pipe_offset,
-        RewriteContext::PipelineProducer,
+        context,
         excluded,
         transparent_prefixes,
         shell_wrapper_depth,
@@ -1589,6 +1609,8 @@ enum RewriteContext {
     Normal,
     PipelineFinal,
     PipelineProducer,
+    /// A producer whose output reaches `tail`: only filters that keep the end of the output.
+    PipelineProducerForTail,
 }
 
 /// Checks whether grep or rg reads patterns from a file.
@@ -1621,6 +1643,35 @@ fn producer_output_is_line_faithful(rtk_cmd: &str, cmd: &str) -> bool {
     };
     let args: Vec<String> = shell_split(cmd).into_iter().skip(1).collect();
     !is_bare_file_list(engine, &args)
+}
+
+/// Item-list filters (matches, entries, commits, hunks, rows) show the first items and fold
+/// the rest behind a `+N more` / recall hint, so `| tail` would return items from the middle
+/// presented as the last ones (`grep -n x f | tail -3` gave line 136 for a match list ending
+/// at 817; `ls dir | tail` gave the oldest names). Runner and linter filters keep the verdict
+/// and summary at the end, so they stay rewritten.
+fn producer_output_keeps_its_end(rtk_cmd: &str) -> bool {
+    !matches!(
+        rtk_cmd,
+        "rtk ast-grep"
+            | "rtk brew"
+            | "rtk df"
+            | "rtk diff"
+            | "rtk du"
+            | "rtk ecs"
+            | "rtk find"
+            | "rtk git"
+            | "rtk grep"
+            | "rtk helm"
+            | "rtk iptables"
+            | "rtk ls"
+            | "rtk pip"
+            | "rtk ps"
+            | "rtk rg"
+            | "rtk systemctl"
+            | "rtk tree"
+            | "rtk wc"
+    )
 }
 
 pub(crate) enum ExcludePattern {
@@ -1982,10 +2033,14 @@ fn rewrite_segment_inner(
         return None;
     }
     // #3171
-    if context == RewriteContext::PipelineProducer
-        && (!rule.pipeline_safety.producer_safe()
-            || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part)
-            || !producer_output_is_line_faithful(rule.rtk_cmd, cmd_part))
+    if matches!(
+        context,
+        RewriteContext::PipelineProducer | RewriteContext::PipelineProducerForTail
+    ) && (!rule.pipeline_safety.producer_safe()
+        || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part)
+        || !producer_output_is_line_faithful(rule.rtk_cmd, cmd_part)
+        || (context == RewriteContext::PipelineProducerForTail
+            && !producer_output_keeps_its_end(rule.rtk_cmd)))
     {
         return None;
     }
@@ -4298,8 +4353,8 @@ mod tests {
     #[test]
     fn test_rewrite_pipe_safe_consumers_producer_rewritten() {
         assert_eq!(
-            rewrite_command_no_prefixes("git log | tail -5", &[]),
-            Some("rtk git log | tail -5".into())
+            rewrite_command_no_prefixes("git log | head -5", &[]),
+            Some("rtk git log | head -5".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | tail -50", &[]),
@@ -4318,16 +4373,16 @@ mod tests {
     #[test]
     fn test_rewrite_multi_pipe_all_safe_consumers() {
         assert_eq!(
-            rewrite_command_no_prefixes("git log | head -20 | tail -5", &[]),
-            Some("rtk git log | head -20 | tail -5".into())
+            rewrite_command_no_prefixes("cargo test | head -20 | tail -5", &[]),
+            Some("rtk cargo test | head -20 | tail -5".into())
         );
     }
 
     #[test]
     fn test_rewrite_pipe_safe_consumer_with_next_clause() {
         assert_eq!(
-            rewrite_command_no_prefixes("git log | tail -5 && git status", &[]),
-            Some("rtk git log | tail -5 && rtk git status".into())
+            rewrite_command_no_prefixes("git log | head -5 && git status", &[]),
+            Some("rtk git log | head -5 && rtk git status".into())
         );
     }
 
@@ -4379,12 +4434,12 @@ mod tests {
     #[test]
     fn test_rewrite_pipe_consumer_fd_dup_redirect_rewritten() {
         assert_eq!(
-            rewrite_command_no_prefixes("git log | tail -5 2>&1", &[]),
-            Some("rtk git log | tail -5 2>&1".into())
+            rewrite_command_no_prefixes("cargo test | tail -5 2>&1", &[]),
+            Some("rtk cargo test | tail -5 2>&1".into())
         );
         assert_eq!(
-            rewrite_command_no_prefixes("git log | tail -5 2>/dev/null", &[]),
-            Some("rtk git log | tail -5 2>/dev/null".into())
+            rewrite_command_no_prefixes("cargo test | tail -5 2>/dev/null", &[]),
+            Some("rtk cargo test | tail -5 2>/dev/null".into())
         );
     }
 
@@ -4417,7 +4472,7 @@ mod tests {
     }
 
     fn assert_consumer_flag_blocks_rewrite(consumer: &str, spelling: &str) {
-        let cmd = format!("git log | {consumer} {spelling}");
+        let cmd = format!("cargo test | {consumer} {spelling}");
         assert_eq!(rewrite_command_no_prefixes(&cmd, &[]), None, "{cmd}");
     }
 
@@ -4468,8 +4523,8 @@ mod tests {
         for cmd in [
             "git log | cat",
             "git log | head -20",
-            "git log | tail -20",
-            "git log | tail -n 20",
+            "cargo test | tail -20",
+            "cargo test | tail -n 20",
         ] {
             assert!(
                 rewrite_command_no_prefixes(cmd, &[]).is_some(),
@@ -4494,8 +4549,8 @@ mod tests {
             assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{cmd}");
         }
         assert_eq!(
-            rewrite_command_no_prefixes("git log | tail -n 20", &[]),
-            Some("rtk git log | tail -n 20".into())
+            rewrite_command_no_prefixes("cargo test | tail -n 20", &[]),
+            Some("rtk cargo test | tail -n 20".into())
         );
     }
 
@@ -4545,13 +4600,55 @@ mod tests {
         }
         // `-c` with `-l` is not folded, and `-e -l` makes `-l` the pattern.
         assert_eq!(
-            rewrite_command_no_prefixes("grep -rlc foo src | tail -3", &[]),
-            Some("rtk grep -rlc foo src | tail -3".into())
+            rewrite_command_no_prefixes("grep -rlc foo src | head -3", &[]),
+            Some("rtk grep -rlc foo src | head -3".into())
         );
         assert_eq!(
-            rewrite_command_no_prefixes("grep -e -l src | tail -3", &[]),
-            Some("rtk grep -e -l src | tail -3".into())
+            rewrite_command_no_prefixes("grep -e -l src | head -3", &[]),
+            Some("rtk grep -e -l src | head -3".into())
         );
+    }
+
+    /// An item-list filter folds everything after its first items, so `tail` would read the
+    /// middle of the list as its end: those producers stay raw under `tail`, and only there.
+    #[test]
+    fn test_rewrite_pipe_list_producer_under_tail_stays_raw() {
+        for cmd in [
+            "git log | tail -5",
+            "git log -50 | tail -20",
+            "git log | head -20 | tail -5",
+            "git diff HEAD~3 | tail -40",
+            "git show HEAD | tail",
+            "git status | tail -n 3",
+            "grep -n let src/main.rs | tail -3",
+            "grep -rn foo src | head -100 | tail -10",
+            "rg foo | tail",
+            "ls -la Docs/audits | tail -40",
+            "find . -name '*.swift' | tail -5",
+            "tree src | tail",
+            "du -sh * | tail -3",
+            "ps aux | tail",
+            "wc -l src/*.rs | tail -1",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{cmd}");
+        }
+        assert_eq!(
+            rewrite_command_no_prefixes("ls Docs | tail -5 && git log -3", &[]),
+            Some("ls Docs | tail -5 && rtk git log -3".into())
+        );
+        for (cmd, rewritten) in [
+            ("git log | head -5", "rtk git log | head -5"),
+            ("ls -la Docs | head -50", "rtk ls -la Docs | head -50"),
+            ("grep -rn foo src | head -40", "rtk grep -rn foo src | head -40"),
+            ("cargo test | tail -20", "rtk cargo test | tail -20"),
+            ("pytest | tail -20", "rtk pytest | tail -20"),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]
@@ -8153,8 +8250,8 @@ mod tests {
     #[test]
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
-            rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("rtk git log | head | tail && rtk git status".into())
+            rewrite_command_no_prefixes("cargo test | head | tail && git status", &[]),
+            Some("rtk cargo test | head | tail && rtk git status".into())
         );
     }
 
